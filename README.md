@@ -46,6 +46,27 @@ sum_digest = digest + another_digest
 sum_digest.percentile(30)  # about 0.3
 ```
 
+#### Percentiles, CDF values, and observed extremes
+
+Compression can move the mean of an outer centroid away from the actual
+smallest or largest observation. A digest therefore keeps `min` and `max`
+separately from its centroids. `percentile(0)` and `percentile(100)` return
+those exact observed values after updates, compression, digest merges, and
+round-trip serialization.
+
+The internal distribution is a piecewise-linear approximation. Its CDF is
+right-continuous, `F(x) = P(X <= x)`, and percentiles use the lower
+generalized inverse `Q(p) = inf{x: F(x) >= p}`. Consequently, at a jump the
+CDF includes the mass at the jump point and a percentile chooses the left
+(lower) side. Centroids are not used to recover original samples.
+
+```
+digest.min, digest.max
+view = digest.distribution_view()
+view.cdf(0.25)
+view.percentile(75)
+```
+
 #### To dict or serializing a digest with JSON
 
 You can use the to_dict() method to turn a TDigest object into a standard Python dictionary.
@@ -67,6 +88,11 @@ For example, make a fresh digest and restore values from a python dictionary.
 digest = TDigest()
 digest.update_from_dict({'K': 25, 'delta': 0.01, 'centroids': [{'c': 1.0, 'm': 1.0}, {'c': 1.0, 'm': 2.0}, {'c': 1.0, 'm': 3.0}]})
 ```
+New dictionaries also contain `min` and `max`. Older summaries that omit those
+fields have unknown exact endpoints: their `min` and `max` are `None`, and
+`percentile(0)`/`percentile(100)` return `None` rather than fabricating
+endpoints from outer centroid means. Their interior interpolation remains
+available through `cdf()` and non-extreme `percentile()` calls.
 
 K and delta values are optional, or you can provide only a list of centroids with `update_centroids_from_list()`.
 ```
@@ -99,6 +125,8 @@ json.dumps(digest, default=encoder)
  - `compress()`: perform a compression on the underlying data structure that will shrink the memory footprint of it, without hurting accuracy. Good to perform after adding many values. 
  - `percentile(p)`: return the `p`th percentile. Example: `p=50` is the median.
  - `cdf(x)`: return the CDF the value `x` is at. 
+ - `distribution_view()`: return the piecewise-linear approximate distribution shared by `percentile()` and `cdf()`.
+ - `min` / `max`: exact observed endpoints, or `None` when imported centroids do not provide them.
  - `trimmed_mean(p1, p2)`: return the mean of data set without the values below and above the `p1` and `p2` percentile respectively. 
  - `to_dict()`: return a Python dictionary of the TDigest and internal Centroid values.
  - `update_from_dict(dict_values)`: update from serialized dictionary values into the TDigest object.
@@ -106,6 +134,5 @@ json.dumps(digest, default=encoder)
  - `update_centroids_from_list(list_values)`: update Centroids from a python list.
 
  
-
 
 

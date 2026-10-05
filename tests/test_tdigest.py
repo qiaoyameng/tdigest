@@ -4,7 +4,7 @@ from numpy import percentile
 from numpy import bitwise_and
 from numpy import testing
 from accumulation_tree import AccumulationTree
-from tdigest.tdigest import TDigest, Centroid
+from tdigest.tdigest import TDigest, Centroid, DistributionView
 
 
 def RBTree(data):
@@ -44,11 +44,21 @@ def example_random_data():
 
 @pytest.fixture()
 def sample_dict():
-    return {'K': 25, 'delta': 0.01, 'centroids': [{'c': 1.0, 'm': 0.0}, {'c': 1.0, 'm': 1.0}, {'c': 1.0, 'm': 2.0}, {'c': 1.0, 'm': 3.0}], 'n': 4}
+    return {'K': 25, 'delta': 0.01, 'min': 0.0, 'max': 3.0,
+            'centroids': [{'c': 1.0, 'm': 0.0}, {'c': 1.0, 'm': 1.0},
+                          {'c': 1.0, 'm': 2.0}, {'c': 1.0, 'm': 3.0}], 'n': 4.0}
 
 @pytest.fixture()
 def sample_centroid_list():
     return [{'c': 1.0, 'm': 1.0}, {'c': 1.0, 'm': 2.0}, {'c': 1.0, 'm': 3.0}]
+
+
+@pytest.fixture()
+def legacy_sample_dict(sample_dict):
+    legacy = dict(sample_dict)
+    del legacy['min']
+    del legacy['max']
+    return legacy
 
 
 class TestTDigest():
@@ -138,6 +148,46 @@ class TestTDigest():
         assert t.percentile(0.1) > data.min()
         assert t.percentile(0.999) < data.max()
 
+    def test_exact_extremes_survive_outer_centroid_shift(self):
+        digest = TDigest.from_dict({
+            'n': 20, 'delta': 0.01, 'K': 25, 'min': 0.0, 'max': 100.0,
+            'centroids': [{'m': 5.0, 'c': 5.0},
+                          {'m': 50.0, 'c': 10.0},
+                          {'m': 95.0, 'c': 5.0}],
+        })
+
+        assert digest.C.min_key() == 5.0
+        assert digest.C.max_key() == 95.0
+        assert digest.min == 0.0
+        assert digest.max == 100.0
+        assert digest.percentile(0) == 0.0
+        assert digest.percentile(100) == 100.0
+
+        digest.compress()
+        assert digest.min == 0.0
+        assert digest.max == 100.0
+        assert digest.percentile(0) == 0.0
+        assert digest.percentile(100) == 100.0
+
+    def test_legacy_summary_does_not_invent_extremes(self, legacy_sample_dict):
+        digest = TDigest.from_dict(legacy_sample_dict)
+
+        assert digest.min is None
+        assert digest.max is None
+        assert digest.percentile(0) is None
+        assert digest.percentile(100) is None
+        assert digest.cdf(-1) == 0.0
+        assert digest.cdf(0) == pytest.approx(0.125)
+        assert digest.cdf(3) == pytest.approx(0.875)
+        assert digest.cdf(4) == 1.0
+
+    def test_legacy_merge_keeps_extremes_unknown(self, legacy_sample_dict):
+        digest = TDigest().update_from_dict(legacy_sample_dict)
+
+        assert digest.min is None
+        assert digest.max is None
+        assert digest.n == 4.0
+
     def test_negative_extreme_percentile_is_still_positive(self, empty_tdigest):
         # Test https://github.com/CamDavidsonPilon/tdigest/issues/16
         t = TDigest()
@@ -154,7 +204,74 @@ class TestTDigest():
         data = [1, 10, 10, 10, 10, 100, 100, 100, 100, 1000]
         t = TDigest()
         t.batch_update(data)
-        assert t.percentile(40) == 32.5
+        assert t.percentile(40) == pytest.approx(32.5)
+
+    def test_weighted_distribution_endpoints_and_inverse(self):
+        digest = TDigest()
+        digest.update(0, 2)
+        digest.update(10, 3)
+        digest.update(20, 5)
+        view = digest.distribution_view()
+
+        assert digest.percentile(0) == 0
+        assert digest.percentile(100) == 20
+        assert view.cdf(-1) == 0
+        assert view.cdf(21) == 1
+
+        for percent in range(1, 100):
+            quantile = percent / 100.0
+            x = view.percentile(percent)
+            assert view.percentile(percent) >= view.percentile(percent - 1)
+            assert view.percentile(percent) <= view.percentile(percent + 1)
+            assert view.cdf(x) + 1e-12 >= quantile
+            if quantile > 0.1:
+                assert view.cdf(x - 0.001) <= quantile
+
+    def test_repeated_values_and_single_point_summaries(self):
+        digest = TDigest()
+        digest.batch_update([5, 5, 5, 5])
+
+        assert digest.percentile(0) == 5
+        assert digest.percentile(50) == 5
+        assert digest.percentile(100) == 5
+        assert digest.cdf(4) == 0
+        assert digest.cdf(5) == 1
+
+        single = TDigest()
+        single.update(7, 3)
+        assert single.distribution_view().cdf(7) == 1
+        assert single.percentile(25) == 7
+
+    def test_known_distribution_view_uses_lower_generalized_inverse(self):
+        view = DistributionView(
+            [(0.0, 2.0), (10.0, 3.0), (20.0, 5.0)],
+            n=10, minimum=-5.0, maximum=25.0,
+        )
+
+        assert view.cdf(-5) == 0
+        assert view.cdf(0) == pytest.approx(0.1)
+        assert view.percentile(10) == 0
+        assert view.cdf(view.percentile(20)) >= 0.2
+        assert view.cdf(20) == pytest.approx(0.75)
+        assert view.percentile(75) == 20
+        assert view.cdf(25) == 1
+
+    def test_merge_preserves_exact_extremes(self):
+        left = TDigest.from_dict({
+            'n': 5, 'min': 0.0, 'max': 10.0,
+            'centroids': [{'m': 1.0, 'c': 2.0}, {'m': 9.0, 'c': 3.0}],
+        })
+        right = TDigest.from_dict({
+            'n': 5, 'min': -5.0, 'max': 20.0,
+            'centroids': [{'m': -4.0, 'c': 2.0}, {'m': 19.0, 'c': 3.0}],
+        })
+
+        merged = left + right
+        assert merged.n == 10
+        assert merged.min == -5.0
+        assert merged.max == 20.0
+        assert merged.percentile(0) == -5.0
+        assert merged.percentile(100) == 20.0
 
     def test_adding_centroid_with_existing_key_does_not_break_synchronicity(self, empty_tdigest, example_centroids):
         td = empty_tdigest
