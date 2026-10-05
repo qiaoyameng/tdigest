@@ -46,6 +46,30 @@ sum_digest = digest + another_digest
 sum_digest.percentile(30)  # about 0.3
 ```
 
+#### Exponentially decaying digest
+
+For monitoring recent latency without a hard cut-off window,
+`ExponentialDecayingTDigest` decays every sample's weight exponentially
+with a fixed half-life. Time is supplied by the caller and must be
+monotonically non-decreasing.
+
+```
+from tdigest import ExponentialDecayingTDigest
+
+digest = ExponentialDecayingTDigest(half_life=60.0)  # weights halve every 60 time units
+digest.update(0.42, t=1000.0)          # update(value, t, w=1)
+digest.batch_update([0.1, 0.2], t=1001.0)
+digest.percentile(99, t=1002.0)        # queries may also advance time
+digest.effective_count                 # total decayed weight
+digest.is_empty                        # True once everything has decayed away
+```
+
+Decay is applied lazily via a global scale factor (no per-update
+rescaling of centroids), with occasional numerical renormalization that
+preserves relative weights. When the effective weight decays below
+`min_effective_weight` the digest resets to an explicit empty state and
+queries return `None`.
+
 #### To dict or serializing a digest with JSON
 
 You can use the to_dict() method to turn a TDigest object into a standard Python dictionary.
@@ -106,6 +130,5 @@ json.dumps(digest, default=encoder)
  - `update_centroids_from_list(list_values)`: update Centroids from a python list.
 
  
-
 
 
