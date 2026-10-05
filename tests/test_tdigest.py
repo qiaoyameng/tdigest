@@ -4,7 +4,7 @@ from numpy import percentile
 from numpy import bitwise_and
 from numpy import testing
 from accumulation_tree import AccumulationTree
-from tdigest.tdigest import TDigest, Centroid
+from tdigest.tdigest import TDigest, Centroid, DigestDistribution
 
 
 def RBTree(data):
@@ -44,7 +44,13 @@ def example_random_data():
 
 @pytest.fixture()
 def sample_dict():
-    return {'K': 25, 'delta': 0.01, 'centroids': [{'c': 1.0, 'm': 0.0}, {'c': 1.0, 'm': 1.0}, {'c': 1.0, 'm': 2.0}, {'c': 1.0, 'm': 3.0}], 'n': 4}
+    return {'K': 25, 'delta': 0.01, 'min': 0.0, 'max': 3.0, 'centroids': [{'c': 1.0, 'm': 0.0}, {'c': 1.0, 'm': 1.0}, {'c': 1.0, 'm': 2.0}, {'c': 1.0, 'm': 3.0}], 'n': 4}
+
+
+@pytest.fixture()
+def legacy_dict():
+    # A summary serialized before exact extremes were tracked: no 'min'/'max'.
+    return {'K': 25, 'delta': 0.01, 'centroids': [{'c': 1.0, 'm': 1.0}, {'c': 1.0, 'm': 2.0}, {'c': 1.0, 'm': 3.0}], 'n': 3}
 
 @pytest.fixture()
 def sample_centroid_list():
@@ -211,6 +217,137 @@ class TestTDigest():
     def test_update_centroids_from_list(self, empty_tdigest, sample_centroid_list):
         td = empty_tdigest
         assert td.update_centroids_from_list(sample_centroid_list).centroids_to_list() == sample_centroid_list
+
+class TestDigestDistribution():
+
+    def test_exact_extremes_survive_compression(self):
+        t = TDigest()
+        data = random.randn(10000)
+        t.batch_update(data)
+        t.compress()
+        dist = t.distribution()
+        assert isinstance(dist, DigestDistribution)
+        assert dist.min_value == data.min()
+        assert dist.max_value == data.max()
+        assert t.percentile(0) == data.min()
+        assert t.percentile(100) == data.max()
+        # F(min) is at most half the outermost centroid's weight: the lower
+        # half of that centroid's mass sits exactly at its mean
+        assert t.cdf(data.min()) <= 1.0 / len(data)
+        assert t.cdf(data.max()) == 1
+        # no mass is placed outside the observed extremes
+        assert t.cdf(data.min() - 1) == 0
+        assert t.cdf(data.max() + 1) == 1
+
+    def test_weighted_known_data(self):
+        t = TDigest()
+        t.update(1, 1)
+        t.update(2, 3)
+        t.update(3, 1)
+        dist = t.distribution()
+        assert dist.n == 5
+        assert t.percentile(0) == 1
+        assert t.percentile(100) == 3
+        assert t.percentile(50) == 2
+        assert t.cdf(2) == 0.5
+        # the known minimum coincides with the first centroid mean, so the
+        # cdf jumps there from 0 to half the first centroid's weight
+        assert t.cdf(1) == 0.1
+        assert t.cdf(3) == 1
+
+    def test_repeated_values_single_centroid(self):
+        t = TDigest()
+        t.batch_update([5, 5, 5, 5])
+        assert len(t) == 1
+        for p in [0, 25, 50, 75, 100]:
+            assert t.percentile(p) == 5
+        assert t.cdf(5) == 1
+        assert t.cdf(4.999) == 0
+
+    def test_single_point_summary(self):
+        t = TDigest()
+        t.update(7)
+        assert t.percentile(0) == 7
+        assert t.percentile(50) == 7
+        assert t.percentile(100) == 7
+        assert t.cdf(7) == 1
+        assert t.cdf(6) == 0
+
+    def test_jump_uses_lower_generalized_inverse(self):
+        # repeated values collapse into one centroid, creating a jump in the
+        # cdf at 1 from 0 to 3/8 of the total weight
+        t = TDigest()
+        t.batch_update([1, 1, 1, 2])
+        # F is right-continuous: the value at the jump is the top of the jump
+        assert t.cdf(1) == 0.375
+        # quantile is the lower generalized inverse Q(p) = inf{x: F(x) >= p},
+        # so every p inside the jump maps back to the jump location
+        assert t.percentile(0) == 1
+        assert t.percentile(10) == 1
+        assert t.percentile(37.5) == 1
+        # the two maps are compatible at the jump
+        assert t.percentile(t.cdf(1) * 100) == 1
+        assert t.cdf(t.percentile(20)) >= 0.2
+
+    def test_monotonicity_and_inverse_relation(self):
+        t = TDigest()
+        t.batch_update([1, 2, 2, 3, 3, 3, 4, 10])
+
+        ps = [i / 100. for i in range(101)]
+        quantiles = [t.percentile(100 * p) for p in ps]
+        assert all(a <= b for a, b in zip(quantiles, quantiles[1:]))
+
+        xs = [1 + 0.5 * i for i in range(19)]  # within [min, max]
+        cdfs = [t.cdf(x) for x in xs]
+        assert all(a <= b for a, b in zip(cdfs, cdfs[1:]))
+
+        for p in ps:
+            assert t.cdf(t.percentile(100 * p)) >= p - 1e-9
+        for x in xs:
+            assert t.percentile(100 * t.cdf(x)) <= x + 1e-9
+
+    def test_merge_preserves_extremes(self):
+        t1 = TDigest()
+        t1.batch_update(random.randn(5000))
+        t2 = TDigest()
+        t2.batch_update(random.randn(5000) + 100)
+        merged = t1 + t2
+        assert merged.percentile(0) == min(t1.percentile(0), t2.percentile(0))
+        assert merged.percentile(100) == max(t1.percentile(100), t2.percentile(100))
+
+    def test_legacy_import_marks_extremes_unknown(self, legacy_dict):
+        t = TDigest.from_dict(legacy_dict)
+        dist = t.distribution()
+        # extremes are unknown, not fabricated from the outermost centroids
+        assert dist.min_value is None
+        assert dist.max_value is None
+        # quantiles at 0/100 fall back to the outermost centroid means as
+        # estimates, and cdf/quantile stay mutually consistent
+        assert t.percentile(0) == 1.0
+        assert t.percentile(100) == 3.0
+        assert t.cdf(2) == 0.5
+        assert t.percentile(t.cdf(2) * 100) == 2.0
+
+    def test_update_from_legacy_dict_marks_extremes_unknown(self, legacy_dict):
+        t = TDigest().update_from_dict(legacy_dict)
+        assert t.distribution().min_value is None
+        assert t.distribution().max_value is None
+
+    def test_merge_with_unknown_extremes_stays_unknown(self, legacy_dict):
+        t_legacy = TDigest.from_dict(legacy_dict)
+        t_known = TDigest()
+        t_known.batch_update([1, 2, 3])
+        merged = t_known + t_legacy
+        assert merged.distribution().min_value is None
+        assert merged.distribution().max_value is None
+
+    def test_extremes_round_trip_through_dict(self):
+        t = TDigest()
+        t.batch_update(random.randn(1000))
+        restored = TDigest.from_dict(t.to_dict())
+        assert restored.percentile(0) == t.percentile(0)
+        assert restored.percentile(100) == t.percentile(100)
+
 
 class TestStatisticalTests():
 
