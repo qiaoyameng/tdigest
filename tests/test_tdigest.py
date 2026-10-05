@@ -1,4 +1,5 @@
 import pytest
+import numpy as np
 from numpy import random
 from numpy import percentile
 from numpy import bitwise_and
@@ -12,6 +13,34 @@ def RBTree(data):
     for k, v in data:
         t.insert(k, v)
     return t
+
+
+def digest_from_centroids(centroids, total_weight=None):
+    digest = TDigest()
+    weight = 0
+    for mean, count in centroids:
+        digest.C.insert(mean, Centroid(mean, count))
+        weight += count
+    digest.n = weight if total_weight is None else total_weight
+    return digest
+
+
+def piecewise_quantile(centroids, probabilities):
+    digest = digest_from_centroids(centroids)
+    quantiles, values = map(np.asarray, digest.centroid_interpolation())
+    index = np.clip(np.searchsorted(quantiles, probabilities, side='right') - 1,
+                    0, len(quantiles) - 2)
+    position = ((probabilities - quantiles[index]) /
+                (quantiles[index + 1] - quantiles[index]))
+    return values[index] + position * (values[index + 1] - values[index])
+
+
+def numerical_wasserstein(left_centroids, right_centroids, samples=1000001):
+    probabilities = np.linspace(0., 1., samples)
+    differences = np.abs(piecewise_quantile(left_centroids, probabilities) -
+                         piecewise_quantile(right_centroids, probabilities))
+    widths = np.diff(probabilities)
+    return float(np.sum(widths * (differences[:-1] + differences[1:]) / 2.))
 
 
 @pytest.fixture()
@@ -172,6 +201,78 @@ class TestTDigest():
         td = empty_tdigest
         td.update(0)
         assert td.cdf(0) == 1
+
+    def test_centroid_interpolation_exposes_percentile_model(self, empty_tdigest):
+        td = digest_from_centroids([(0., 1.), (1., 1.), (2., 1.)])
+        quantiles, values = td.centroid_interpolation()
+
+        assert quantiles == [0., 1. / 6., .5, 5. / 6., 1.]
+        assert values == [0., 0., 1., 2., 2.]
+        assert td.quantile(0.) == 0
+        assert td.quantile(1. / 8.) == .25
+        assert td.quantile(.5) == 1
+        assert td.quantile(1.) == 2
+
+    @pytest.mark.parametrize("left_centroids,right_centroids,expected", [
+        ([(1., 2.)], [(-2., 5.)], 3.),
+        ([(0., 1.), (2., 1.), (4., 1.)],
+         [(1., 1.), (3., 1.), (5., 1.)], 1.),
+        ([(0., 1.), (2., 1.), (4., 1.)],
+         [(.5, 1.), (1.5, 1.), (2.5, 1.), (3.5, 1.)], 19. / 48.),
+    ])
+    def test_wasserstein_distance_matches_numerical_integration(
+            self, left_centroids, right_centroids, expected):
+        left = digest_from_centroids(left_centroids)
+        right = digest_from_centroids(right_centroids)
+
+        assert left.wasserstein_distance(right) == pytest.approx(expected)
+        assert right.wasserstein_distance(left) == pytest.approx(expected)
+        assert left.wasserstein_distance(right) == pytest.approx(
+            numerical_wasserstein(left_centroids, right_centroids), abs=1e-9)
+
+    def test_wasserstein_distance_normalizes_different_total_weights(self):
+        left = digest_from_centroids([(0., 1.), (10., 1.)])
+        right = digest_from_centroids([(1., 4.), (11., 4.)])
+
+        assert left.wasserstein_distance(right) == pytest.approx(1.)
+        assert right.wasserstein_distance(left) == pytest.approx(1.)
+
+    @pytest.mark.parametrize("left_centroids,right_centroids", [
+        ([], [(1., 1.)]),
+        ([(1., 1.)], []),
+        ([], []),
+    ])
+    def test_wasserstein_distance_rejects_empty_summaries(
+            self, left_centroids, right_centroids):
+        left = digest_from_centroids(left_centroids)
+        right = digest_from_centroids(right_centroids)
+
+        with pytest.raises(ValueError):
+            left.wasserstein_distance(right)
+
+    @pytest.mark.parametrize("mean,count", [
+        (float('inf'), 1.),
+        (float('nan'), 1.),
+        (1., float('inf')),
+        (1., float('nan')),
+    ])
+    def test_wasserstein_distance_rejects_nonfinite_values(self, mean, count):
+        left = digest_from_centroids([(mean, count)])
+        right = digest_from_centroids([(1., 1.)])
+
+        with pytest.raises(ValueError):
+            left.wasserstein_distance(right)
+
+    def test_wasserstein_distance_rejects_negative_weight(self):
+        left = digest_from_centroids([(0., 1.)])
+        right = digest_from_centroids([(0., 1.)], total_weight=0)
+
+        with pytest.raises(ValueError):
+            left.wasserstein_distance(right)
+
+    def test_wasserstein_distance_rejects_non_tdigest(self):
+        with pytest.raises(TypeError):
+            TDigest().wasserstein_distance(object())
 
     def test_to_dict(self, empty_tdigest, sample_dict):
         td = empty_tdigest
