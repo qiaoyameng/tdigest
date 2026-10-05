@@ -1,5 +1,8 @@
 ## Changelog
 
+### Unreleased
+ - added `merge_many(digests, delta=None, K=None, random_state=None)`: a deterministic, order-independent way to merge a group of t-digest shards. It normalises centroid order, combines equal-mean weights, never mutates the global `random` state, rejects negative weights and non-finite means, and preserves total weight and min/max extremes.
+
 ### 0.5.2.1
  - Fixes pickling error when using PySpark.
 

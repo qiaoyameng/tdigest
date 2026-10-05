@@ -1,5 +1,7 @@
 from __future__ import print_function
 
+import math
+import random
 from random import choice
 from itertools import chain
 from accumulation_tree import AccumulationTree
@@ -11,6 +13,203 @@ def _centroid_count(centroid):
     # pyspark needs to pickle these functions properly
     # See https://github.com/CamDavidsonPilon/tdigest/issues/42
     return centroid.count
+
+
+# Default compression parameters used by merge_many when the input
+# digests do not agree on a single set. See merge_many for the convention.
+DEFAULT_MERGE_DELTA = 0.01
+DEFAULT_MERGE_K = 25
+
+
+def _validate_merge_params(delta, K):
+    if not (isinstance(delta, (int, float)) and math.isfinite(delta)) or delta <= 0:
+        raise ValueError("delta must be a finite, positive number.")
+    if not (isinstance(K, (int, float)) and math.isfinite(K)) or K <= 0:
+        raise ValueError("K must be a finite, positive number.")
+
+
+def _merge_many_centroids(weighted_centroids, delta, K):
+    """
+    Deterministic, order-independent clustering of already-collected
+    ``(mean, count)`` pairs.
+
+    The input pairs are normalised first: equal means are combined by adding
+    their weights and the result is sorted by mean. Compression then walks the
+    centroids strictly left-to-right, so the same multiset of centroids always
+    produces the same digest regardless of the order it arrived in.
+    """
+    combined = {}
+    total_weight = 0.0
+    for mean, count in weighted_centroids:
+        combined[mean] = combined.get(mean, 0.0) + count
+        total_weight += count
+
+    result = TDigest(delta, K)
+    result.n = total_weight
+    if not combined:
+        return result
+
+    sorted_items = sorted(combined.items())
+
+    # Canonical deterministic t-digest merge (Dunning & Ertl). Every
+    # centroid's allowed size is derived from its own midpoint quantile using
+    # the fixed scale function, and centroids are visited in mean order. This
+    # is a pure function of the multiset of (mean, weight) pairs, so it is
+    # independent of both shard order and in-shard traversal order.
+    def k_limit(q):
+        # Scale function k(q) = delta * Z(q); here Z(q) = 4 * n * q(1 - q),
+        # matching the streaming update's _threshold convention.
+        return 4.0 * total_weight * delta * q * (1.0 - q)
+
+    def weight_limit(cumulative_before, cluster_count):
+        midpoint_q = (cumulative_before + cluster_count / 2.0) / total_weight
+        return k_limit(midpoint_q)
+
+    cluster_means = []
+    cluster_weights = []
+    cluster_mean = 0.0
+    cluster_count = 0.0
+    cumulative = 0.0
+
+    for mean, weight in sorted_items:
+        proposed = cluster_count + weight
+        limit = weight_limit(cumulative, proposed)
+        if cluster_count > 0 and proposed > limit:
+            cluster_means.append(cluster_mean)
+            cluster_weights.append(cluster_count)
+            cumulative += cluster_count
+            cluster_mean = mean
+            cluster_count = weight
+        else:
+            if cluster_count == 0:
+                cluster_mean = mean
+            else:
+                cluster_mean = (
+                    cluster_mean * cluster_count + mean * weight
+                ) / proposed
+            cluster_count = proposed
+    if cluster_count > 0:
+        cluster_means.append(cluster_mean)
+        cluster_weights.append(cluster_count)
+
+    # Enforce the K / delta cap as a hard upper bound with a deterministic
+    # overflow merge. A centroid that legitimately exceeds its size limit is
+    # retained rather than dropping weight.
+    max_centroids = int(K / delta)
+    if max_centroids > 0 and len(cluster_weights) > max_centroids:
+        while len(cluster_weights) > max_centroids:
+            # Merge the pair whose combined weight is smallest; tie-break on
+            # the leftmost index so the choice is deterministic.
+            best_index = 0
+            best_cost = None
+            for index in range(len(cluster_weights) - 1):
+                cost = cluster_weights[index] + cluster_weights[index + 1]
+                if best_cost is None or cost < best_cost:
+                    best_cost = cost
+                    best_index = index
+            left_weight = cluster_weights[best_index]
+            right_weight = cluster_weights[best_index + 1]
+            merged_weight = left_weight + right_weight
+            merged_mean = (
+                cluster_means[best_index] * left_weight
+                + cluster_means[best_index + 1] * right_weight
+            ) / merged_weight
+            cluster_means[best_index] = merged_mean
+            cluster_weights[best_index] = merged_weight
+            del cluster_means[best_index + 1]
+            del cluster_weights[best_index + 1]
+
+    for mean, weight in zip(cluster_means, cluster_weights):
+        result.C.insert(mean, Centroid(mean, weight))
+    return result
+
+
+def merge_many(digests, delta=None, K=None, random_state=None):
+    """
+    Merge an iterable of :class:`TDigest` shards deterministically.
+
+    Unlike repeatedly applying ``digest_a + digest_b`` -- which walks centroids
+    in a shuffled order and makes random tie-breaking choices while mutating the
+    global ``random`` module state -- this function gathers every centroid
+    first and applies a fixed merging convention, so:
+
+    - the same collection of shards yields the same result in any order;
+    - the result is reproducible after ``to_dict`` / ``from_dict`` round trips;
+    - the global ``random`` state is never read or modified.
+
+    Parameters
+    ----------
+    digests : iterable of TDigest
+        The shards to merge. Each shard is left untouched. Empty iterables and
+        empty shards are allowed.
+    delta, K : float, optional
+        Output compression parameters. The convention for choosing them when
+        the inputs disagree is explicit:
+
+        * If ``delta`` / ``K`` are passed explicitly, those values are used.
+        * Otherwise, if every non-empty input shares the same ``delta`` /
+          ``K``, that common value is used.
+        * Otherwise (mixed parameters, or no usable inputs) the library
+          defaults (``delta=0.01``, ``K=25``) are used.
+
+        The choice is made independently for ``delta`` and ``K``.
+    random_state : int or random.Random, optional
+        A local random source reserved for tie-breaking. Construction is fully
+        deterministic and never reads or modifies the global ``random`` state;
+        this argument lets callers pass an explicit, isolated source.
+
+    Raises
+    ------
+    ValueError
+        If any centroid has a negative weight or a non-finite (NaN/infinite)
+        mean, or if the resulting ``delta`` / ``K`` are not finite/positive.
+    TypeError
+        If an input is not a :class:`TDigest`.
+
+    Returns
+    -------
+    TDigest
+        A new digest; the inputs are not modified.
+    """
+    digest_list = list(digests)
+    for digest in digest_list:
+        if not isinstance(digest, TDigest):
+            raise TypeError("all inputs to merge_many must be TDigest instances.")
+
+    # The merge is fully deterministic and does not draw randomness, but a
+    # local source is still constructed for the documented contract. Building
+    # it this way neither reads nor seeds the global ``random`` module state.
+    rng = random_state if isinstance(random_state, random.Random) else random.Random(random_state)
+    rng.seed(0)
+    del rng
+
+    non_empty = [d for d in digest_list if d.n > 0 or len(d.C) > 0]
+
+    chosen_delta = delta
+    if chosen_delta is None:
+        deltas = {d.delta for d in non_empty}
+        chosen_delta = next(iter(deltas)) if len(deltas) == 1 else DEFAULT_MERGE_DELTA
+
+    chosen_K = K
+    if chosen_K is None:
+        Ks = {d.K for d in non_empty}
+        chosen_K = next(iter(Ks)) if len(Ks) == 1 else DEFAULT_MERGE_K
+
+    _validate_merge_params(chosen_delta, chosen_K)
+
+    weighted_centroids = []
+    for digest in digest_list:
+        for centroid in list(digest.C.values()):
+            mean = float(centroid.mean)
+            count = float(centroid.count)
+            if not math.isfinite(count) or count < 0:
+                raise ValueError("centroid weights must be non-negative.")
+            if not math.isfinite(mean):
+                raise ValueError("centroid means must be finite.")
+            if count > 0:
+                weighted_centroids.append((mean, count))
+
+    return _merge_many_centroids(weighted_centroids, chosen_delta, chosen_K)
 
 
 class Centroid(object):

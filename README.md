@@ -46,6 +46,38 @@ sum_digest = digest + another_digest
 sum_digest.percentile(30)  # about 0.3
 ```
 
+#### Merge many shards deterministically
+
+Repeatedly using `+` to reconcile shards can return different results each
+time because it traverses centroids in a shuffled order and makes random
+tie-breaking choices (it also advances the global `random` state). For
+offline reconciliation of a group of shards, use `merge_many`, which applies
+a fixed, deterministic convention:
+
+```
+from tdigest import merge_many
+
+merged = merge_many(shards)
+```
+
+`merge_many` normalises the input centroids (sorting by mean and combining
+equal means by adding their weights) and never touches the global `random`
+state. The same group of shards gives the same result in any permutation, and
+the result is reproducible after a `to_dict()` / `from_dict()` round trip.
+Total weight and the min/max extremes are always preserved.
+
+Output compression parameters follow an explicit rule. If `delta`/`K` are
+passed they are used; otherwise, if every non-empty input shares a value that
+value is used; otherwise the library defaults (`delta=0.01`, `K=25`) are
+used. An isolated source can be supplied with `random_state`:
+
+```
+merged = merge_many(shards, delta=0.01, K=25, random_state=0)
+```
+
+Negative centroid weights and non-finite means raise `ValueError`; inputs are
+never modified.
+
 #### To dict or serializing a digest with JSON
 
 You can use the to_dict() method to turn a TDigest object into a standard Python dictionary.
@@ -100,12 +132,11 @@ json.dumps(digest, default=encoder)
  - `percentile(p)`: return the `p`th percentile. Example: `p=50` is the median.
  - `cdf(x)`: return the CDF the value `x` is at. 
  - `trimmed_mean(p1, p2)`: return the mean of data set without the values below and above the `p1` and `p2` percentile respectively. 
+ - `merge_many(digests, delta=None, K=None, random_state=None)`: deterministically merge an iterable of digests into a new digest, independent of shard order and without touching the global `random` state.
  - `to_dict()`: return a Python dictionary of the TDigest and internal Centroid values.
  - `update_from_dict(dict_values)`: update from serialized dictionary values into the TDigest object.
  - `centroids_to_list()`: return a Python list of the TDigest object's internal Centroid values.
  - `update_centroids_from_list(list_values)`: update Centroids from a python list.
 
  
-
-
 

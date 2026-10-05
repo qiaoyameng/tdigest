@@ -1,10 +1,12 @@
+import random as py_random
+import itertools
 import pytest
 from numpy import random
 from numpy import percentile
 from numpy import bitwise_and
 from numpy import testing
 from accumulation_tree import AccumulationTree
-from tdigest.tdigest import TDigest, Centroid
+from tdigest.tdigest import TDigest, Centroid, merge_many
 
 
 def RBTree(data):
@@ -301,3 +303,192 @@ class TestCentroid():
         c.update(value, weight)
         assert c.count == 4
         assert c.mean == 1 * 1 / 4. + 2 * 1 / 4. + 1 * 2 / 4.
+
+
+def _raw_digest(mean_weight_pairs, delta=0.01, K=25):
+    """Build a TDigest directly from (mean, weight) pairs, no merging."""
+    t = TDigest(delta, K)
+    for mean, weight in mean_weight_pairs:
+        t.C.insert(mean, Centroid(mean, weight))
+        t.n += weight
+    return t
+
+
+class TestMergeMany():
+
+    def _shards(self, seed=7, n_shards=5, size=1000):
+        py_random.seed(seed)
+        shards = []
+        for _ in range(n_shards):
+            t = TDigest()
+            t.batch_update([py_random.gauss(0, 1) for _ in range(size)])
+            shards.append(t)
+        return shards
+
+    def test_returns_tdigest(self):
+        assert isinstance(merge_many(self._shards(n_shards=2, size=50)), TDigest)
+
+    def test_permutation_invariant(self):
+        shards = self._shards()
+        reference = merge_many(shards).to_dict()
+        for permutation in itertools.permutations(shards):
+            assert merge_many(list(permutation)).to_dict() == reference
+
+    def test_determinism_repeated_calls(self):
+        shards = self._shards()
+        first = merge_many(shards).to_dict()
+        second = merge_many(list(reversed(shards))).to_dict()
+        assert first == second
+
+    def test_reproducible_after_save_and_reload(self):
+        shards = self._shards()
+        merged = merge_many(shards)
+
+        reloaded_shards = [TDigest.from_dict(s.to_dict()) for s in shards]
+        merged_reloaded = merge_many(reloaded_shards)
+
+        assert merged_reloaded.to_dict() == merged.to_dict()
+
+        once_more = TDigest.from_dict(merged.to_dict())
+        assert once_more.to_dict() == merged.to_dict()
+
+    def test_total_weight_preserved(self):
+        shards = self._shards()
+        expected_n = sum(s.n for s in shards)
+        merged = merge_many(shards)
+        assert merged.n == expected_n
+        assert sum(c['c'] for c in merged.centroids_to_list()) == expected_n
+
+    def test_extreme_values_preserved(self):
+        shards = self._shards()
+        all_centroids = [c for s in shards for c in s.centroids_to_list()]
+        global_min = min(c['m'] for c in all_centroids)
+        global_max = max(c['m'] for c in all_centroids)
+
+        merged = merge_many(shards)
+        assert merged.percentile(0) == global_min
+        assert merged.percentile(100) == global_max
+
+    def test_same_mean_weights_are_combined(self):
+        a = _raw_digest([(1.0, 2.0), (3.0, 1.0)])
+        b = _raw_digest([(1.0, 3.0), (5.0, 4.0)])
+        merged = merge_many([a, b])
+
+        by_mean = {c['m']: c['c'] for c in merged.centroids_to_list()}
+        assert by_mean[1.0] == 5.0
+        assert merged.n == 10.0
+        assert sum(by_mean.values()) == 10.0
+
+    def test_inputs_are_not_modified(self):
+        shards = self._shards(n_shards=3, size=200)
+        snapshots = [s.to_dict() for s in shards]
+        merge_many(shards)
+        assert [s.to_dict() for s in shards] == snapshots
+
+    def test_does_not_mutate_global_random_state(self):
+        shards = self._shards()
+        py_random.seed(999)
+        state = py_random.getstate()
+        expected = py_random.random()
+        py_random.setstate(state)
+
+        merge_many(shards, random_state=1234)
+        merge_many(shards, random_state=py_random.Random(7))
+
+        assert py_random.random() == expected
+
+    def test_random_state_does_not_change_result(self):
+        shards = self._shards()
+        reference = merge_many(shards).to_dict()
+        assert merge_many(shards, random_state=1).to_dict() == reference
+        assert merge_many(shards, random_state=2).to_dict() == reference
+        assert merge_many(shards, random_state=py_random.Random(3)).to_dict() == reference
+
+    def test_common_parameters_are_used(self):
+        a = TDigest(delta=0.05, K=10); a.update(1)
+        b = TDigest(delta=0.05, K=10); b.update(2)
+        merged = merge_many([a, b])
+        assert merged.delta == 0.05
+        assert merged.K == 10
+
+    def test_mixed_delta_falls_back_to_default(self):
+        a = TDigest(delta=0.05, K=10); a.update(1)
+        b = TDigest(delta=0.02, K=10); b.update(2)
+        merged = merge_many([a, b])
+        assert merged.delta == 0.01
+        assert merged.K == 10
+
+    def test_mixed_K_falls_back_to_default(self):
+        a = TDigest(delta=0.05, K=10); a.update(1)
+        b = TDigest(delta=0.05, K=20); b.update(2)
+        merged = merge_many([a, b])
+        assert merged.delta == 0.05
+        assert merged.K == 25
+
+    def test_explicit_parameters_override(self):
+        a = TDigest(delta=0.05, K=10); a.update(1)
+        b = TDigest(delta=0.02, K=20); b.update(2)
+        merged = merge_many([a, b], delta=0.002, K=99)
+        assert merged.delta == 0.002
+        assert merged.K == 99
+
+    def test_empty_iterable(self):
+        merged = merge_many([])
+        assert merged.n == 0
+        assert merged.centroids_to_list() == []
+
+    def test_empty_shards_are_ignored(self):
+        a = TDigest()
+        b = self._shards(n_shards=1, size=300)[0]
+        assert merge_many([a, b]).to_dict() == merge_many([b]).to_dict()
+
+    def test_negative_weight_rejected(self):
+        bad = _raw_digest([(1.0, -2.0)])
+        with pytest.raises(ValueError):
+            merge_many([bad])
+
+    def test_non_finite_mean_rejected(self):
+        for bad_mean in (float('nan'), float('inf'), float('-inf')):
+            bad = _raw_digest([(bad_mean, 1.0)])
+            with pytest.raises(ValueError):
+                merge_many([bad])
+
+    def test_non_tdigest_input_rejected(self):
+        with pytest.raises(TypeError):
+            merge_many([1, 2])
+
+    def test_invalid_explicit_parameters_rejected(self):
+        a = TDigest(); a.update(1)
+        with pytest.raises(ValueError):
+            merge_many([a], delta=-1)
+        with pytest.raises(ValueError):
+            merge_many([a], K=0)
+
+    def test_k_delta_cap_deterministic_and_weight_preserving(self):
+        py_random.seed(3)
+        shards = []
+        for _ in range(4):
+            t = TDigest(delta=0.5, K=5)
+            t.batch_update([py_random.random() for _ in range(500)])
+            shards.append(t)
+
+        merged = merge_many(shards)
+        assert len(merged) <= int(5 / 0.5)
+        assert merged.n == 2000
+        assert sum(c['c'] for c in merged.centroids_to_list()) == 2000
+
+        reference = merged.to_dict()
+        for permutation in itertools.islice(itertools.permutations(shards), 6):
+            assert merge_many(list(permutation)).to_dict() == reference
+
+    def test_percentile_accuracy_uniform(self):
+        py_random.seed(0)
+        shards = []
+        for _ in range(4):
+            t = TDigest()
+            t.batch_update([py_random.random() for _ in range(2500)])
+            shards.append(t)
+        merged = merge_many(shards)
+        assert abs(merged.percentile(50) - 0.5) < 0.01
+        assert abs(merged.percentile(1) - 0.01) < 0.005
+        assert abs(merged.percentile(99) - 0.99) < 0.005
