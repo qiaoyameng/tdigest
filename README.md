@@ -46,6 +46,24 @@ sum_digest = digest + another_digest
 sum_digest.percentile(30)  # about 0.3
 ```
 
+#### Compare two summarized distributions
+
+The first Wasserstein distance measures the difference between the complete
+approximated distributions rather than a single percentile. It is computed
+between the piecewise-linear distributions represented by the centroids, not
+as the exact distance between the original observations.
+
+```
+from tdigest import wasserstein_distance
+
+distance = wasserstein_distance(today_digest, yesterday_digest)
+# Equivalent: today_digest.wasserstein_distance(yesterday_digest)
+```
+
+Each digest is normalized by its own total centroid weight, so summaries with
+different sample counts can be compared. Empty digests, non-finite centroid
+means or weights, and non-positive weights raise `ValueError`.
+
 #### To dict or serializing a digest with JSON
 
 You can use the to_dict() method to turn a TDigest object into a standard Python dictionary.
@@ -99,6 +117,8 @@ json.dumps(digest, default=encoder)
  - `compress()`: perform a compression on the underlying data structure that will shrink the memory footprint of it, without hurting accuracy. Good to perform after adding many values. 
  - `percentile(p)`: return the `p`th percentile. Example: `p=50` is the median.
  - `cdf(x)`: return the CDF the value `x` is at. 
+ - `centroid_distribution()`: return the normalized piecewise-linear CDF anchors `(mean, cdf_left, cdf_right)` used by `cdf` and `wasserstein_distance`.
+ - `wasserstein_distance(other_digest)`: return the first Wasserstein distance between the two normalized summary distributions.
  - `trimmed_mean(p1, p2)`: return the mean of data set without the values below and above the `p1` and `p2` percentile respectively. 
  - `to_dict()`: return a Python dictionary of the TDigest and internal Centroid values.
  - `update_from_dict(dict_values)`: update from serialized dictionary values into the TDigest object.

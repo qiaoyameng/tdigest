@@ -1,5 +1,9 @@
 ## Changelog
 
+### Unreleased
+ - Added `wasserstein_distance` and `TDigest.wasserstein_distance` for the first Wasserstein distance between normalized, centroid-interpolated summary distributions.
+ - Added `TDigest.centroid_distribution` to expose the piecewise-linear CDF model shared by CDF and distance calculations.
+
 ### 0.5.2.1
  - Fixes pickling error when using PySpark.
 

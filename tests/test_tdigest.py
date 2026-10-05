@@ -4,7 +4,108 @@ from numpy import percentile
 from numpy import bitwise_and
 from numpy import testing
 from accumulation_tree import AccumulationTree
+from decimal import Decimal, getcontext
+
+from tdigest import wasserstein_distance
 from tdigest.tdigest import TDigest, Centroid
+
+
+def digest_from_centroids(centroids, total_weight=None, delta=0.01, K=25):
+    data = {
+        'K': K,
+        'delta': delta,
+        'n': total_weight if total_weight is not None else sum(weight for _, weight in centroids),
+        'centroids': [{'m': mean, 'c': weight} for mean, weight in centroids],
+    }
+    return TDigest.from_dict(data)
+
+
+def reference_centroid_cdf(centroids, x, side='right'):
+    means = [Decimal(str(mean)) for mean, _ in centroids]
+    weights = [Decimal(str(weight)) for _, weight in centroids]
+    x = Decimal(str(x))
+    total_weight = sum(weights)
+    anchors = []
+    cumulative_weight = Decimal(0)
+
+    for weight in weights:
+        anchors.append((cumulative_weight + weight / 2) / total_weight)
+        cumulative_weight += weight
+
+    if x < means[0]:
+        return Decimal(0)
+    if x > means[-1]:
+        return Decimal(1)
+
+    for i, mean in enumerate(means):
+        if x == mean:
+            if len(means) == 1:
+                return Decimal(1)
+            if i == 0:
+                return anchors[0] if side == 'right' else Decimal(0)
+            if i == len(means) - 1:
+                return Decimal(1) if side == 'right' else anchors[-1]
+            return anchors[i]
+        if x < mean:
+            previous_mean = means[i - 1]
+            previous_anchor = anchors[i - 1]
+            width = mean - previous_mean
+            return previous_anchor + (anchors[i] - previous_anchor) * (x - previous_mean) / width
+
+    return Decimal(1)
+
+
+def simpson_integrate(function, left, right):
+    midpoint = (left + right) / 2
+    return (right - left) * (
+        function(left) + 4 * function(midpoint) + function(right)
+    ) / 6
+
+
+def adaptive_simpson(function, left, right, tolerance, depth=24):
+    midpoint = (left + right) / 2
+    whole = simpson_integrate(function, left, right)
+    left_half = simpson_integrate(function, left, midpoint)
+    right_half = simpson_integrate(function, midpoint, right)
+    error = left_half + right_half - whole
+
+    if depth == 0 or abs(error) <= 15 * tolerance:
+        return left_half + right_half + error / 15
+
+    return (
+        adaptive_simpson(function, left, midpoint, tolerance / 2, depth - 1) +
+        adaptive_simpson(function, midpoint, right, tolerance / 2, depth - 1)
+    )
+
+
+def reference_wasserstein_distance(first_centroids, second_centroids):
+    getcontext().prec = 50
+    breakpoints = sorted(set(
+        [Decimal(str(mean)) for mean, _ in first_centroids] +
+        [Decimal(str(mean)) for mean, _ in second_centroids]
+    ))
+    distance = Decimal(0)
+
+    for left, right in zip(breakpoints, breakpoints[1:]):
+        def integrand(
+            x,
+            first_centroids=first_centroids,
+            second_centroids=second_centroids,
+            left=left,
+            right=right
+        ):
+            first_side = 'right' if x == left else 'left' if x == right else 'right'
+            second_side = 'right' if x == left else 'left' if x == right else 'right'
+            return abs(
+                reference_centroid_cdf(first_centroids, x, first_side) -
+                reference_centroid_cdf(second_centroids, x, second_side)
+            )
+
+        distance += adaptive_simpson(
+            integrand, left, right, Decimal('1e-35')
+        )
+
+    return float(distance)
 
 
 def RBTree(data):
@@ -172,6 +273,89 @@ class TestTDigest():
         td = empty_tdigest
         td.update(0)
         assert td.cdf(0) == 1
+
+    def test_cdf_rejects_non_finite_value(self, empty_tdigest):
+        td = empty_tdigest
+        td.update(0)
+
+        with pytest.raises(ValueError):
+            td.cdf(float('nan'))
+
+    def test_centroid_distribution_is_shared_interpolation_model(self):
+        td = digest_from_centroids([(0, 2), (10, 2)])
+
+        assert td.centroid_distribution() == [
+            (0, 0, 0.25),
+            (10, 0.75, 1),
+        ]
+        assert td.cdf(5) == 0.5
+        assert td.percentile(50) == 5
+
+    def test_wasserstein_distance_between_point_masses(self):
+        first = digest_from_centroids([(0, 1)])
+        second = digest_from_centroids([(5, 2)])
+
+        assert first.wasserstein_distance(second) == 5
+        assert second.wasserstein_distance(first) == 5
+        assert wasserstein_distance(first, second) == 5
+        assert wasserstein_distance(second, first) == 5
+
+    def test_wasserstein_distance_normalizes_different_total_weights(self):
+        centroids = [(0, 1), (2, 2), (5, 1), (9, 3)]
+        scaled_centroids = [(mean, weight * 17) for mean, weight in centroids]
+
+        first = digest_from_centroids(centroids)
+        second = digest_from_centroids(scaled_centroids)
+
+        assert first.wasserstein_distance(second) == 0
+
+    def test_wasserstein_distance_is_order_independent(self):
+        first = digest_from_centroids([(0, 1), (2, 2), (5, 1), (9, 3), (12, 1)])
+        second = digest_from_centroids([(1, 2), (3, 1), (4, 4), (7, 2), (10, 2), (12, 2)])
+
+        assert first.wasserstein_distance(second) == second.wasserstein_distance(first)
+
+    def test_wasserstein_distance_of_shifted_summary_is_shift(self):
+        centroids = [(0, 1), (1, 2), (3, 1), (6, 3), (10, 1)]
+        shift = Decimal('1.5')
+        shifted = [(float(Decimal(str(mean)) + shift), weight) for mean, weight in centroids]
+
+        first = digest_from_centroids(centroids)
+        second = digest_from_centroids(shifted)
+
+        assert first.wasserstein_distance(second) == pytest.approx(1.5)
+        assert first.wasserstein_distance(second) == pytest.approx(
+            reference_wasserstein_distance(centroids, shifted), abs=1e-12
+        )
+
+    def test_wasserstein_distance_matches_numerical_integration(self):
+        first_centroids = [(0, 1), (2, 2), (5, 1), (9, 3), (12, 1)]
+        second_centroids = [(1, 2), (3, 1), (4, 4), (7, 2), (10, 2), (12, 2)]
+        first = digest_from_centroids(first_centroids, delta=0.05, K=25)
+        second = digest_from_centroids(second_centroids, delta=0.005, K=50)
+
+        naive_equal_weight_difference = 4. / 3
+        assert first.wasserstein_distance(second) == pytest.approx(
+            reference_wasserstein_distance(first_centroids, second_centroids), abs=1e-12
+        )
+        assert first.wasserstein_distance(second) != pytest.approx(naive_equal_weight_difference)
+
+    @pytest.mark.parametrize('centroids', [
+        [],
+        [(float('nan'), 1)],
+        [(float('inf'), 1)],
+        [(1, float('nan'))],
+        [(1, float('-inf'))],
+        [(1, 0)],
+        [(1, -1)],
+    ])
+    def test_wasserstein_distance_rejects_invalid_summaries(self, centroids):
+        total_weight = sum(weight for _, weight in centroids)
+        first = digest_from_centroids([(0, 1)])
+        second = digest_from_centroids(centroids, total_weight=total_weight)
+
+        with pytest.raises(ValueError):
+            wasserstein_distance(first, second)
 
     def test_to_dict(self, empty_tdigest, sample_dict):
         td = empty_tdigest

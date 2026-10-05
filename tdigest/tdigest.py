@@ -1,5 +1,6 @@
 from __future__ import print_function
 
+from math import isfinite
 from random import choice
 from itertools import chain
 from accumulation_tree import AccumulationTree
@@ -11,6 +12,63 @@ def _centroid_count(centroid):
     # pyspark needs to pickle these functions properly
     # See https://github.com/CamDavidsonPilon/tdigest/issues/42
     return centroid.count
+
+
+def _cdf_at_breakpoint(points, x, side='right'):
+    if not isfinite(x):
+        raise ValueError("cdf evaluation point must be finite")
+    if x < points[0][0]:
+        return 0.
+    if x > points[-1][0]:
+        return 1.
+
+    for i, (mean, cdf_left, cdf_right) in enumerate(points):
+        if x == mean:
+            return cdf_right if side == 'right' else cdf_left
+        if x < mean:
+            previous_mean, _, previous_cdf = points[i - 1]
+            width = mean - previous_mean
+            return previous_cdf + (cdf_left - previous_cdf) * (x - previous_mean) / width
+
+    return 1.
+
+
+def _linear_absolute_area(width, first, second):
+    if first * second < 0:
+        return width / 2. * (first * first + second * second) / abs(first - second)
+    return width / 2. * (abs(first) + abs(second))
+
+
+def wasserstein_distance(first_digest, second_digest):
+    """
+    Compute the first Wasserstein distance between two TDigest summaries.
+
+    The distance is between the normalized, piecewise-linear distributions
+    represented by the centroid summaries, not an exact distance between the
+    original observations. Each digest is normalized by its own finite,
+    positive total centroid weight, so unequal totals are supported. Empty
+    digests, non-finite values, and non-positive weights raise ValueError.
+    """
+    first_points = first_digest.centroid_distribution()
+    second_points = second_digest.centroid_distribution()
+    breakpoints = sorted(set(
+        [point[0] for point in first_points] +
+        [point[0] for point in second_points]
+    ))
+
+    distance = 0.
+    for left, right in zip(breakpoints, breakpoints[1:]):
+        first_at_left = _cdf_at_breakpoint(first_points, left, 'right')
+        second_at_left = _cdf_at_breakpoint(second_points, left, 'right')
+        first_at_right = _cdf_at_breakpoint(first_points, right, 'left')
+        second_at_right = _cdf_at_breakpoint(second_points, right, 'left')
+
+        distance += _linear_absolute_area(
+            right - left,
+            first_at_left - second_at_left,
+            first_at_right - second_at_right
+        )
+    return distance
 
 
 class Centroid(object):
@@ -164,54 +222,92 @@ class TDigest(object):
         if not (0 <= p <= 100):
             raise ValueError("p must be between 0 and 100, inclusive.")
 
-        p = float(p)/100.
-        p *= self.n
-        c_i = None
-        t = 0
+        q = float(p) / 100.
+        centroids, total_weight, anchors = self._centroid_distribution_anchors()
 
-        if p == 0:
-            return self.C.min_item()[1].mean
+        if len(centroids) == 1 or q * total_weight <= anchors[0]:
+            return centroids[0].mean
+        if q >= 1:
+            return centroids[-1].mean
 
-        for i, key in enumerate(self.C.keys()):
-            c_i_plus_one = self.C[key]
-            if i == 0:
-                k = c_i_plus_one.count / 2
+        target_weight = q * total_weight
 
-            else:
-                k = (c_i_plus_one.count + c_i.count) / 2.
-                if p <= t + k:
-                    z1 = p - t
-                    z2 = t + k - p
-                    return (c_i.mean * z2 + c_i_plus_one.mean * z1) / k
-            c_i = c_i_plus_one
-            t += k
+        for i in range(len(centroids) - 1):
+            left_weight = anchors[i]
+            right_weight = anchors[i + 1]
+            if target_weight <= right_weight:
+                z1 = target_weight - left_weight
+                z2 = right_weight - target_weight
+                segment_weight = right_weight - left_weight
+                return (centroids[i].mean * z2 + centroids[i + 1].mean * z1) / segment_weight
 
-        return self.C.max_item()[1].mean
+        return centroids[-1].mean
 
     def cdf(self, x):
         """
         Computes the cdf of a specific value, ie. computes F(x) where F denotes
-        the CDF of the distribution.
+        the CDF of the distribution. Non-finite values raise ValueError.
         """
-        t = 0
-        N = float(self.n)
+        points = self.centroid_distribution()
+        return _cdf_at_breakpoint(points, float(x), 'right')
 
-        if len(self) == 1:  # only one centroid
-            return int(x >= self.C.min_key())
+    def centroid_distribution(self):
+        """
+        Return the piecewise-linear CDF implied by the centroids.
 
-        for i, key in enumerate(self.C.keys()):
-            c_i = self.C[key]
-            if i == len(self) - 1:
-                delta = (c_i.mean - self.C.prev_item(key)[1].mean) / 2.
+        Each item is ``(mean, cdf_left, cdf_right)``. A centroid's weight is
+        split equally between the two neighbouring interpolation intervals;
+        half of an endpoint centroid's weight is represented as an endpoint
+        jump. CDF values are normalized by the centroid weights, so digests
+        with different total weights can be compared as probability
+        distributions.
+        """
+        centroids, total_weight, raw_anchors = self._centroid_distribution_anchors()
+
+        if len(centroids) == 1:
+            mean = centroids[0].mean
+            return [(mean, 0., 1.)]
+
+        points = []
+        for i, centroid in enumerate(centroids):
+            anchor = raw_anchors[i] / total_weight
+            if i == 0:
+                points.append((centroid.mean, 0., anchor))
+            elif i == len(centroids) - 1:
+                points.append((centroid.mean, anchor, 1.))
             else:
-                delta = (self.C.succ_item(key)[1].mean - c_i.mean) / 2.
-            z = max(-1, (x - c_i.mean) / delta)
+                points.append((centroid.mean, anchor, anchor))
+        return points
 
-            if z < 1:
-                return t / N + c_i.count / N * (z + 1) / 2
+    def _centroid_distribution_anchors(self):
+        centroids = list(self.C.values())
+        if not centroids:
+            raise ValueError("cannot construct a distribution from an empty TDigest")
 
-            t += c_i.count
-        return 1
+        total_weight = 0.
+        for centroid in centroids:
+            mean = float(centroid.mean)
+            count = float(centroid.count)
+            if not isfinite(mean) or not isfinite(count) or count <= 0:
+                raise ValueError("centroid means and weights must be finite and positive")
+            total_weight += count
+
+        if not isfinite(total_weight) or total_weight <= 0:
+            raise ValueError("total centroid weight must be finite and positive")
+
+        anchors = []
+        cumulative_weight = 0.
+        for centroid in centroids:
+            anchors.append(cumulative_weight + centroid.count / 2.)
+            cumulative_weight += centroid.count
+
+        return centroids, total_weight, anchors
+
+    def wasserstein_distance(self, other_digest):
+        """
+        First Wasserstein distance between the centroid-interpolated summaries.
+        """
+        return wasserstein_distance(self, other_digest)
 
     def trimmed_mean(self, p1, p2):
         """
