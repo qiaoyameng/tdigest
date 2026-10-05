@@ -1,6 +1,7 @@
 from __future__ import print_function
 
-from random import choice
+import math
+import random
 from itertools import chain
 from accumulation_tree import AccumulationTree
 import pyudorandom
@@ -33,12 +34,18 @@ class Centroid(object):
 
 class TDigest(object):
 
-    def __init__(self, delta=0.01, K=25):
+    def __init__(self, delta=0.01, K=25, random_state=None):
 
         self.C = AccumulationTree(_centroid_count)
         self.n = 0
         self.delta = delta
         self.K = K
+        # A local random source (e.g. random.Random(seed)). When None, the
+        # global `random` module is used, preserving historical behaviour.
+        self.random_state = random_state
+
+    def _rng(self):
+        return self.random_state if self.random_state is not None else random
 
     def __add__(self, other_digest):
         data = list(chain(self.C.values(), other_digest.C.values()))
@@ -49,6 +56,65 @@ class TDigest(object):
                 new_digest.update(c.mean, c.count)
 
         return new_digest
+
+    @classmethod
+    def merge_many(cls, digests, delta=None, K=None, random_state=None):
+        """
+        Deterministically merge an iterable of TDigest instances into a new
+        TDigest, without modifying any of the input digests.
+
+        Deterministic merge convention:
+          1. All centroids from all inputs are validated: a centroid with a
+             non-finite mean or a negative (or non-finite) weight raises
+             ValueError. Zero-weight centroids are ignored.
+          2. Centroids sharing the same mean have their weights summed into a
+             single centroid.
+          3. The combined centroids are replayed into the output digest in
+             ascending mean order, so any permutation of the same input
+             digests yields the same result. Note this does not make
+             arbitrary sequences of binary `+` merges associative.
+
+        Output parameters:
+          - `delta` defaults to the smallest delta among the inputs (the
+            finest resolution); `K` defaults to the largest K among the
+            inputs. Both can be overridden explicitly.
+
+        Randomness:
+          - `random_state` may be a random.Random instance (or any object
+            with a `choice` method) used as a local random source. When
+            omitted, a private random.Random with a fixed seed is used, so
+            merging never touches the global `random` module state and is
+            fully reproducible, including after a to_dict/from_dict
+            round-trip of the inputs.
+        """
+        digests = list(digests)
+
+        if delta is None:
+            delta = min((d.delta for d in digests), default=0.01)
+        if K is None:
+            K = max((d.K for d in digests), default=25)
+
+        rng = random_state if random_state is not None else random.Random(0)
+        merged = cls(delta=delta, K=K, random_state=rng)
+
+        weight_by_mean = {}
+        for digest in digests:
+            for centroid in digest.C.values():
+                mean, count = centroid.mean, centroid.count
+                if not math.isfinite(mean):
+                    raise ValueError(
+                        "cannot merge a centroid with non-finite mean: %r" % mean)
+                if not math.isfinite(count) or count < 0:
+                    raise ValueError(
+                        "cannot merge a centroid with negative or non-finite weight: %r" % count)
+                if count == 0:
+                    continue
+                weight_by_mean[mean] = weight_by_mean.get(mean, 0.0) + count
+
+        for mean in sorted(weight_by_mean):
+            merged.update(mean, weight_by_mean[mean])
+
+        return merged
 
     def __len__(self):
         return len(self.C)
@@ -115,7 +181,7 @@ class TDigest(object):
         S = self._find_closest_centroids(x)
 
         while len(S) != 0 and w > 0:
-            j = choice(list(range(len(S))))
+            j = self._rng().choice(list(range(len(S))))
             c_j = S[j]
 
             q = self._compute_centroid_quantile(c_j)
@@ -150,7 +216,7 @@ class TDigest(object):
         return
 
     def compress(self):
-        T = TDigest(self.delta, self.K)
+        T = TDigest(self.delta, self.K, random_state=self.random_state)
         C = list(self.C.values())
         for c_i in pyudorandom.items(C):
             T.update(c_i.mean, c_i.count)

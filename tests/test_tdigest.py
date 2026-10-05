@@ -1,3 +1,6 @@
+import random as stdlib_random
+from itertools import permutations
+
 import pytest
 from numpy import random
 from numpy import percentile
@@ -301,3 +304,118 @@ class TestCentroid():
         c.update(value, weight)
         assert c.count == 4
         assert c.mean == 1 * 1 / 4. + 2 * 1 / 4. + 1 * 2 / 4.
+
+
+def _raw_digest(centroids, delta=0.01, K=25):
+    """Build a TDigest directly from centroids, without any randomness."""
+    return TDigest.from_dict({
+        'n': sum(c['c'] for c in centroids),
+        'delta': delta,
+        'K': K,
+        'centroids': centroids,
+    })
+
+
+@pytest.fixture()
+def shards():
+    centroid_lists = [
+        [{'m': -2.0, 'c': 2.0}, {'m': -1.0, 'c': 1.0}, {'m': 0.5, 'c': 3.0}],
+        [{'m': -1.0, 'c': 4.0}, {'m': 0.5, 'c': 1.0}, {'m': 2.0, 'c': 2.0}],
+        [{'m': 0.5, 'c': 1.0}, {'m': 1.5, 'c': 5.0}, {'m': 3.0, 'c': 1.0}],
+        [{'m': -3.0, 'c': 1.0}, {'m': 2.0, 'c': 1.0}, {'m': 4.0, 'c': 2.0}],
+    ]
+    return [_raw_digest(cs) for cs in centroid_lists]
+
+
+class TestMergeMany():
+
+    def test_any_permutation_of_shards_gives_same_result(self, shards):
+        reference = TDigest.merge_many(shards).to_dict()
+        for permutation in permutations(range(len(shards))):
+            ordered = [shards[i] for i in permutation]
+            assert TDigest.merge_many(ordered).to_dict() == reference
+
+    def test_repeatable_across_calls_and_serialization_roundtrip(self, shards):
+        merged_once = TDigest.merge_many(shards).to_dict()
+        merged_twice = TDigest.merge_many(shards).to_dict()
+        assert merged_once == merged_twice
+
+        reloaded = [TDigest.from_dict(d.to_dict()) for d in shards]
+        assert TDigest.merge_many(reloaded).to_dict() == merged_once
+
+    def test_total_weight_and_extremes_are_preserved(self, shards):
+        merged = TDigest.merge_many(shards)
+        assert merged.n == sum(d.n for d in shards)
+
+        centroids = [c for d in shards for c in d.centroids_to_list()]
+        assert merged.percentile(0) == min(c['m'] for c in centroids)
+        assert merged.percentile(100) == max(c['m'] for c in centroids)
+
+    def test_global_random_state_is_not_touched(self, shards):
+        stdlib_random.seed(12345)
+        state_before = stdlib_random.getstate()
+        TDigest.merge_many(shards)
+        assert stdlib_random.getstate() == state_before
+
+    def test_local_random_state_is_specifiable_and_deterministic(self, shards):
+        merged1 = TDigest.merge_many(shards, random_state=stdlib_random.Random(42))
+        merged2 = TDigest.merge_many(shards, random_state=stdlib_random.Random(42))
+        assert merged1.to_dict() == merged2.to_dict()
+
+    def test_input_digests_are_not_modified(self, shards):
+        snapshots = [d.to_dict() for d in shards]
+        TDigest.merge_many(shards)
+        assert [d.to_dict() for d in shards] == snapshots
+
+    def test_centroids_with_same_mean_have_weights_combined(self):
+        d1 = _raw_digest([{'m': 2.0, 'c': 3.0}])
+        d2 = _raw_digest([{'m': 2.0, 'c': 4.0}])
+        merged = TDigest.merge_many([d1, d2])
+        centroids = merged.centroids_to_list()
+        assert merged.n == 7.0
+        assert len(centroids) == 1
+        assert centroids[0] == {'m': 2.0, 'c': 7.0}
+
+    def test_zero_weight_centroids_are_ignored(self):
+        digest = _raw_digest([{'m': 1.0, 'c': 1.0}, {'m': 5.0, 'c': 0.0}])
+        merged = TDigest.merge_many([digest])
+        assert merged.n == 1.0
+        assert merged.percentile(100) == 1.0
+
+    def test_rejects_negative_weights(self, shards):
+        bad = _raw_digest([{'m': 1.0, 'c': 1.0}])
+        next(iter(bad.C.values())).count = -1.0
+        with pytest.raises(ValueError):
+            TDigest.merge_many(shards + [bad])
+
+    def test_rejects_non_finite_weights(self, shards):
+        bad = _raw_digest([{'m': 1.0, 'c': 1.0}])
+        next(iter(bad.C.values())).count = float('nan')
+        with pytest.raises(ValueError):
+            TDigest.merge_many(shards + [bad])
+
+    def test_rejects_non_finite_centers(self, shards):
+        for bad_mean in (float('nan'), float('inf'), float('-inf')):
+            bad = _raw_digest([{'m': 1.0, 'c': 1.0}])
+            next(iter(bad.C.values())).mean = bad_mean
+            with pytest.raises(ValueError):
+                TDigest.merge_many(shards + [bad])
+
+    def test_output_delta_and_K_default_to_min_delta_and_max_K(self):
+        d1 = _raw_digest([{'m': 1.0, 'c': 1.0}], delta=0.01, K=25)
+        d2 = _raw_digest([{'m': 2.0, 'c': 1.0}], delta=0.05, K=40)
+        merged = TDigest.merge_many([d1, d2])
+        assert merged.delta == 0.01
+        assert merged.K == 40
+
+    def test_output_delta_and_K_can_be_overridden(self):
+        d1 = _raw_digest([{'m': 1.0, 'c': 1.0}], delta=0.01, K=25)
+        d2 = _raw_digest([{'m': 2.0, 'c': 1.0}], delta=0.05, K=40)
+        merged = TDigest.merge_many([d1, d2], delta=0.1, K=10)
+        assert merged.delta == 0.1
+        assert merged.K == 10
+
+    def test_merging_no_digests_returns_empty_digest(self):
+        merged = TDigest.merge_many([])
+        assert len(merged) == 0
+        assert merged.n == 0
